@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Save and switch named Codex accounts, without logging secrets."""
+import base64
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import tomllib
+
+
+def read_auth(path):
+    try:
+        raw = path.read_bytes()
+        data = json.loads(raw)
+    except (OSError, ValueError):
+        raise ValueError(f"无法读取有效认证文件：{path.name}") from None
+    if not isinstance(data, dict):
+        raise ValueError(f"认证文件格式不正确：{path.name}")
+    tokens = data.get("tokens") or {}
+    if not isinstance(tokens, dict):
+        raise ValueError(f"认证文件格式不正确：{path.name}")
+    key = data.get("OPENAI_API_KEY")
+    if tokens.get("account_id") and tokens.get("access_token"):
+        subject = None
+        try:
+            part = tokens.get("id_token", "").split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+            subject = claims.get("sub")
+        except (ValueError, IndexError, AttributeError, TypeError):
+            pass
+        identity = ("chatgpt", tokens["account_id"], subject)
+    elif isinstance(key, str) and key:
+        identity = ("api", hashlib.sha256(key.encode()).hexdigest())
+    else:
+        raise ValueError(f"认证文件缺少账号或凭据：{path.name}")
+    return raw, identity
+
+
+def write_private(path, raw):
+    fd, name = tempfile.mkstemp(prefix=".codex-account-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as file:
+            file.write(raw)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def stop_background_server(home):
+    if not (home / "app-server-daemon" / "daemon.pid").exists():
+        return False
+    executable = shutil.which("codex")
+    if not executable:
+        raise ValueError("找不到 codex，无法停止旧后台服务；认证文件未切换。")
+    try:
+        result = subprocess.run(
+            [executable, "app-server", "daemon", "stop"],
+            env={**os.environ, "CODEX_HOME": str(home)},
+            capture_output=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError("停止后台服务超时；认证文件未切换，请检查 codex app-server daemon stop。") from None
+    if result.returncode:
+        raise ValueError("无法停止旧后台服务；认证文件未切换，请检查 codex app-server daemon stop。")
+    return True
+
+
+def latest_auth(active_raw, saved_raw):
+    def refreshed(raw):
+        try:
+            stamp = json.loads(raw).get("last_refresh")
+            return datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except (ValueError, TypeError, AttributeError):
+            return datetime.min.replace(tzinfo=timezone.utc)
+    return saved_raw if refreshed(saved_raw) > refreshed(active_raw) else active_raw
+
+
+def login_account(home, profile, existing=None):
+    expected_id = read_auth(profile)[1] if profile.exists() else None
+    executable = shutil.which("codex")
+    if not executable:
+        raise ValueError("找不到 codex，无法登录。")
+    with tempfile.TemporaryDirectory(prefix=".codex-account-login-", dir=home) as directory:
+        result = subprocess.run(
+            [executable, "-c", 'cli_auth_credentials_store="file"', "login"],
+            env={**os.environ, "CODEX_HOME": directory},
+        )
+        if result.returncode:
+            raise ValueError("登录未完成，原账号配置未修改。")
+        raw, identity = read_auth(Path(directory) / "auth.json")
+        if expected_id is not None and identity != expected_id:
+            raise ValueError("登录的账号与所选账号不一致，原账号配置未修改；请使用对应账号登录。")
+        for name, (_, other_id) in (existing or {}).items():
+            if identity == other_id:
+                raise ValueError(f"这个账号已经保存为 {name}，无需重复添加。")
+    write_private(profile, raw)
+
+
+RESERVED = {"add", "login", "status", "list", "toggle", "save", "import"}
+
+
+def valid_name(name):
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", name)) and name not in RESERVED
+
+
+def discover_profiles(home):
+    profiles = {}
+    # Recognize the original two-account script's backups when present.
+    for name, filename in (("huang", "auth_main.json"), ("li", "auth_l.json")):
+        path = home / filename
+        if path.is_file():
+            profiles[name] = path
+    directory = home / "accounts"
+    if directory.is_dir():
+        for path in sorted(directory.glob("*.json")):
+            if valid_name(path.stem):
+                if path.stem in profiles:
+                    raise ValueError(f"账号名 {path.stem} 同时存在于旧备份和 accounts 目录，请先解决重名。")
+                profiles[path.stem] = path
+    return profiles
+
+
+def identify(identity, saved):
+    matches = [name for name, (_, other) in saved.items() if other == identity]
+    if len(matches) > 1:
+        raise ValueError("同一个账号被保存了多次，请先解决重复账号。")
+    return matches[0] if matches else None
+
+
+def file_storage_only(home):
+    config = home / "config.toml"
+    if config.exists():
+        try:
+            data = tomllib.loads(config.read_text())
+        except (ValueError, UnicodeError):
+            raise ValueError("config.toml 无法解析，未修改认证文件。") from None
+        if data.get("cli_auth_credentials_store", "file") != "file":
+            raise ValueError('仅支持文件认证，请先在 config.toml 中设置 cli_auth_credentials_store = "file"。')
+
+
+def main():
+    args = sys.argv[1:]
+    if args in (["-h"], ["--help"]):
+        print("""codex-account — 保存并切换本机 Codex 账号
+
+用法：
+  codex-account save 名字          保存当前 auth.json，不切换
+  codex-account add 名字           浏览器登录新账号并保存，不切换
+  codex-account import 名字 文件   从认证 JSON 文件导入，不切换
+  codex-account 名字               切换到已保存的账号
+  codex-account login 名字         重新登录已保存的账号并切换
+  codex-account list               列出账号，* 表示当前认证文件匹配的账号
+  codex-account status             显示当前认证文件匹配的账号
+  codex-account [toggle]           按列表顺序轮换账号
+
+账号名以英文字母开头，可含数字、下划线、连字符，最长 32 位。
+认证保存在 $CODEX_HOME/accounts/（默认 ~/.codex/accounts/），权限为 600。
+切换会停止共享后台服务；请先结束其他终端中的 Codex 任务。
+下次启动 codex 使用所选账号，已运行的独立进程需要退出后重启。
+""")
+        return
+    operation = None
+    if len(args) == 2 and args[0] in ("add", "login", "save"):
+        operation, action = args
+    elif len(args) == 3 and args[0] == "import":
+        operation, action = args[:2]
+    elif len(args) <= 1:
+        action = args[0] if args else "toggle"
+        if action in ("add", "login", "save", "import"):
+            raise ValueError("命令缺少参数；运行 codex-account --help 查看用法。")
+    else:
+        raise ValueError("参数不正确；运行 codex-account --help 查看用法。")
+    if (operation or action not in RESERVED) and not valid_name(action):
+        raise ValueError("账号名须以英文字母开头，只能含字母、数字、下划线或连字符，最长 32 位，且不能使用命令名。")
+
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser().resolve()
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    active = home / "auth.json"
+    lock_fd = os.open(home / ".codex-account.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(lock_fd, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        profiles = discover_profiles(home)
+        saved = {name: read_auth(path) for name, path in profiles.items()}
+        current_auth = read_auth(active) if active.exists() else None
+        current = identify(current_auth[1], saved) if current_auth else None
+        if action == "list" and not operation:
+            for name in profiles:
+                print(f"{'*' if name == current else ' '} {name}")
+            if not profiles:
+                print("尚未保存账号，运行 codex-account save 名字 或 codex-account add 名字。")
+            return
+        if action == "status" and not operation:
+            print(f"认证文件账号：{current or ('未命名（运行 codex-account save 名字）' if current_auth else '未登录')}")
+            return
+
+        file_storage_only(home)
+        directory = home / "accounts"
+        if operation in ("add", "save", "import"):
+            if action in profiles:
+                raise ValueError(f"账号名 {action} 已存在；重新登录请使用 codex-account login {action}。")
+            directory.mkdir(mode=0o700, exist_ok=True)
+            profile = directory / f"{action}.json"
+            if operation == "add":
+                print(f"请在浏览器登录新账号，将保存为 {action}。", flush=True)
+                login_account(home, profile, existing=saved)
+            else:
+                source = active if operation == "save" else Path(args[2]).expanduser()
+                raw, identity = read_auth(source)
+                duplicate = identify(identity, saved)
+                if duplicate:
+                    raise ValueError(f"这个账号已经保存为 {duplicate}，无需重复添加。")
+                write_private(profile, raw)
+            print(f"已保存账号：{action}。当前认证文件未修改；切换请运行 codex-account {action}。")
+            return
+
+        if operation == "login" or action != "toggle":
+            if action not in profiles:
+                raise ValueError(f"未保存账号 {action}；新增请运行 codex-account add {action}。")
+        if not profiles:
+            raise ValueError("尚未保存账号；先运行 codex-account save 名字 或 codex-account add 名字。")
+        if current_auth and current is None:
+            raise ValueError("当前账号尚未保存；先运行 codex-account save 名字，以免丢失当前凭据。")
+        names = list(profiles)
+        target = names[(names.index(current) + 1) % len(names)] if action == "toggle" and current else (names[0] if action == "toggle" else action)
+        if operation == "login":
+            print(f"请在浏览器登录 {target} 对应的账号。", flush=True)
+            login_account(home, profiles[target])
+            saved[target] = read_auth(profiles[target])
+
+        stopped = stop_background_server(home)
+        # A daemon may persist newer or different credentials while shutting down.
+        if active.exists():
+            current_raw, current_id = read_auth(active)
+            current = identify(current_id, saved)
+            if current is None:
+                raise ValueError("后台停止后出现未保存的账号；未覆盖认证文件，请先运行 codex-account save 名字。")
+            current_raw = latest_auth(current_raw, saved[current][0])
+            write_private(profiles[current], current_raw)
+            saved[current] = (current_raw, current_id)
+        write_private(active, saved[target][0])
+        detail = "旧后台服务已停止；" if stopped else ""
+        print(f"已配置账号：{target}。{detail}下次运行 codex 使用该账号。")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyboardInterrupt) as error:
+        print(f"错误：{error or '已取消'}", file=sys.stderr)
+        sys.exit(1)

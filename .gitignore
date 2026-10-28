@@ -1,0 +1,15 @@
+# Credential files must never be committed.
+auth*.json
+accounts/
+.codex/
+.codex-account*
+.env
+.env.*
+*.pem
+*.key
+
+# Local development files.
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
